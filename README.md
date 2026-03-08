@@ -50,6 +50,6 @@ SESエンジニアとして働いていく中でAI技術に興味を持ち、
 
 ## 作成者情報
 
-Shohei Saito
-GitHub：shohei-saito07
+Shohei Saito  
+GitHub：shohei-saito07  
 Qiita：shohei-saito07
