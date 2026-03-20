@@ -4,10 +4,13 @@
 必要: pip install streamlit anthropic numpy
 """
 
-import os
-import numpy as np
 import streamlit as st
-import anthropic
+
+from langchain_community.vectorstores import Chroma
+from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
 
 st.set_page_config(
     page_title="社内ドキュメント検索AI",
@@ -46,61 +49,41 @@ DOCUMENTS = [
     {"id": "6", "title": "情報セキュリティポリシー", "content": "社外への情報持ち出しは原則禁止です。USBメモリの使用は情報システム部の承認が必要です。パスワードは90日ごとに変更してください。"},
 ]
 
-def build_vocab(documents):
-    words = set()
-    for doc in documents:
-        for word in (doc["title"] + " " + doc["content"]).lower().split():
-            if len(word) > 1:
-                words.add(word)
-    return list(words)
-
-def vectorize(text, vocab):
-    words = text.lower().split()
-    vec = np.zeros(len(vocab))
-    for i, word in enumerate(vocab):
-        vec[i] = words.count(word)
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
-
-def retrieve(query, documents, vocab, top_k=2):
-    if not vocab:
-        return []
-    q_vec = vectorize(query, vocab)
-    scored = []
-    for doc in documents:
-        d_vec = vectorize(doc["title"] + " " + doc["content"], vocab)
-        score = float(np.dot(q_vec, d_vec))
-        scored.append((score, doc))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(doc, score) for score, doc in scored[:top_k] if score > 0]
-
-def generate_answer(query, retrieved, api_key=None):
-    if not retrieved:
-        context = "関連するドキュメントが見つかりませんでした。"
-    else:
-        context = "\n\n".join([f"【{doc['title']}】\n{doc['content']}" for doc, _ in retrieved])
-    prompt = f"""あなたは社内規定に詳しいアシスタントです。
-以下の社内ドキュメントを参照して、質問に日本語で答えてください。
-
-=== 参照ドキュメント ===
-{context}
-======================
-
-質問: {query}"""
-    import requests
-    response = requests.post("http://localhost:11434/api/generate", json={
-        "model": "llama3.2",
-        "prompt": prompt,
-        "stream": False
-    })
-    return response.json()["response"]
-
-if "documents" not in st.session_state:
-    st.session_state.documents = DOCUMENTS.copy()
+# セッション状態の初期化
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "vocab" not in st.session_state:
-    st.session_state.vocab = build_vocab(DOCUMENTS)
+if "documents" not in st.session_state:
+    st.session_state.documents = DOCUMENTS.copy()
+
+# ChromaDBの初期化
+@st.cache_resource
+def init_vectorstore():
+    embeddings = OllamaEmbeddings(model="llama3.2")
+    texts = [doc["title"] + " " + doc["content"] for doc in DOCUMENTS]
+    vectorstore = Chroma.from_texts(texts, embeddings)
+    retriever = vectorstore.as_retriever()
+    return retriever
+
+# LLMとChainの初期化
+def init_chain():
+    retriever = init_vectorstore()
+    llm = OllamaLLM(model="llama3.2")
+    prompt = ChatPromptTemplate.from_template("""
+    あなたは社内規定に詳しいアシスタントです。
+    以下の文章を参考に質問に日本語で答えてください。
+    
+    文章：
+    {context}
+    
+    質問：{question}
+    """
+    )
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+    )
+    return chain
 
 st.markdown("""
 <div class="header-box">
@@ -112,7 +95,6 @@ st.markdown("""
 left_col, right_col = st.columns([2, 1])
 
 with left_col:
-    api_key = st.text_input("Anthropic APIキー", type="password", placeholder="sk-ant-...")
     st.markdown("---")
     if st.session_state.chat_history:
         for item in st.session_state.chat_history:
@@ -133,30 +115,30 @@ with left_col:
             st.session_state.chat_history = []
             st.rerun()
     if search_btn and query:
-        if not api_key:
-            st.error("APIキーを入力してください")
-        else:
-            with st.spinner("検索中..."):
-                retrieved = retrieve(query, st.session_state.documents, st.session_state.vocab)
-                answer = generate_answer(query, retrieved, api_key)
-                sources = [doc["title"] for doc, _ in retrieved]
-                st.session_state.chat_history.append({"query": query, "answer": answer, "sources": sources})
-                st.rerun()
+        with st.spinner("検索中..."):
+            chain = init_chain()
+            answer = chain.invoke(query)
+            st.session_state.chat_history.append({
+                "query": query,
+                "answer": answer,
+                "sources": []
+            })
+            st.rerun()
     st.markdown('<p class="section-title">クイック質問</p>', unsafe_allow_html=True)
     quick_questions = ["残業45時間を超えた場合は？", "リモートワークは何日まで？", "経費精算の締め切りは？"]
     cols = st.columns(3)
     for i, q in enumerate(quick_questions):
         with cols[i]:
             if st.button(q, use_container_width=True, key=f"quick_{i}"):
-                if api_key:
-                    with st.spinner("検索中..."):
-                        retrieved = retrieve(q, st.session_state.documents, st.session_state.vocab)
-                        answer = generate_answer(q, retrieved, api_key)
-                        sources = [doc["title"] for doc, _ in retrieved]
-                        st.session_state.chat_history.append({"query": q, "answer": answer, "sources": sources})
-                        st.rerun()
-                else:
-                    st.error("APIキーを入力してください")
+                with st.spinner("検索中..."):
+                    chain = init_chain()
+                    answer = chain.invoke(q)
+                    st.session_state.chat_history.append({
+                        "query": q,
+                        "answer": answer,
+                        "sources": []
+                    })
+                    st.rerun()
 
 with right_col:
     st.markdown(f'<div class="stat-card"><div class="stat-number">{len(st.session_state.documents)}</div><div class="stat-label">登録ドキュメント数</div></div>', unsafe_allow_html=True)
@@ -172,7 +154,6 @@ with right_col:
         if new_title and new_content:
             new_doc = {"id": str(len(st.session_state.documents) + 1), "title": new_title, "content": new_content}
             st.session_state.documents.append(new_doc)
-            st.session_state.vocab = build_vocab(st.session_state.documents)
             st.success(f"「{new_title}」を追加しました")
             st.rerun()
         else:
